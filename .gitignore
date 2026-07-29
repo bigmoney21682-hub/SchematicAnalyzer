@@ -1,0 +1,33 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# pdf.js data files, copied out of node_modules at build time
+public/pdfjs/
+
+# The shared library's schematics. Tens of megabytes per manual, and they are
+# data rather than source -- a deployment keeps them on its own disk. Commit
+# this folder deliberately if you ever want a set of schematics to ship with
+# the app itself.
+data/
