@@ -8,6 +8,7 @@ import { Settings } from './components/Settings'
 import { formatBytes, prepareImage, type PreparedImage } from './lib/image'
 import type { LoadedPdf } from './lib/pdf'
 import { getProvider } from './lib/providers'
+import { usingProxy } from './lib/proxy'
 import { apiKeyStore, historyStore, modelStore, providerStore } from './lib/storage'
 import type { Analysis, ChatMessage } from './lib/types'
 
@@ -107,7 +108,7 @@ export default function App() {
     if (!image) return
     const provider = getProvider(providerId)
 
-    if (provider.needsKey && !apiKey) {
+    if (provider.needsKey && !apiKey && !usingProxy()) {
       setError('Add an API key in Settings first, or switch to Demo mode to see how it works.')
       setShowSettings(true)
       return

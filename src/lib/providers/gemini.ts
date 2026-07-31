@@ -1,18 +1,40 @@
 import type { Analysis, AnalyzeInput, ChatInput, Provider } from '../types'
 import { CHAT_SYSTEM_PROMPT, SYSTEM_PROMPT, buildUserPrompt } from '../prompt'
+import { proxyStore, usingProxy } from '../proxy'
 
 /**
- * Google AI Studio (generativelanguage) supports CORS, so we can call it
+ * Google AI Studio (generativelanguage) supports CORS, so by default we call it
  * straight from the browser with the user's own key. Nothing passes through the
  * host serving this app.
+ *
+ * Configuring a proxy in Settings gives that up deliberately: one key, held by
+ * the Worker, serves everyone who has the passphrase, and every sheet then
+ * travels through whoever runs that Worker. Direct remains the default.
  *
  * Model IDs move around; if you get a 404 listing the model, check
  * https://ai.google.dev/gemini-api/docs/models and update DEFAULT_MODEL, or
  * just hit Test in Settings and pick from what the key can actually reach.
  */
 const DEFAULT_MODEL = 'gemini-flash-latest'
-const API_ROOT = 'https://generativelanguage.googleapis.com/v1beta'
-const endpointFor = (model: string, method: string) => `${API_ROOT}/models/${model}:${method}`
+const GOOGLE_ROOT = 'https://generativelanguage.googleapis.com/v1beta'
+
+/**
+ * Builds the URL and auth headers for one call. Direct mode puts the user's key
+ * in the query string; proxy mode sends the shared passphrase and lets the
+ * Worker attach the key. Everything downstream — friendlyError, the response
+ * schema, readSse — is identical either way, which is why the proxy is a URL
+ * swap rather than a whole second provider.
+ */
+function route(path: string, params: Record<string, string>, apiKey = '') {
+  const { url: proxy, token } = proxyStore.get()
+  const query = new URLSearchParams(params)
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+
+  if (proxy) headers['X-App-Token'] = token
+  else query.set('key', apiKey)
+
+  return { url: `${proxy || GOOGLE_ROOT}${path}?${query}`, headers }
+}
 
 const enumConfidence = { type: 'STRING', enum: ['high', 'medium', 'low'] }
 const enumEvidence = { type: 'STRING', enum: ['labelled', 'symbol', 'inferred', 'guess'] }
@@ -325,7 +347,8 @@ function friendlyError(status: number, body: string, model = DEFAULT_MODEL): str
  * call alone can't distinguish.
  */
 export async function listGeminiModels(apiKey: string): Promise<string[]> {
-  const res = await fetch(`${API_ROOT}/models?key=${encodeURIComponent(apiKey)}&pageSize=200`)
+  const { url, headers } = route('/models', { pageSize: '200' }, apiKey)
+  const res = await fetch(url, { headers })
   if (!res.ok) throw new GeminiError(friendlyError(res.status, await res.text().catch(() => '')))
   const json = await res.json()
   return (json?.models ?? [])
@@ -368,14 +391,16 @@ export const geminiProvider: Provider = {
   defaultModel: DEFAULT_MODEL,
 
   async analyze(input: AnalyzeInput, { apiKey, model, signal }): Promise<Analysis> {
-    if (!apiKey) throw new GeminiError('No API key set. Add one in Settings.')
+    if (!apiKey && !usingProxy())
+      throw new GeminiError('No API key set. Add one in Settings.')
     const chosen = model || DEFAULT_MODEL
+    const { url, headers } = route(`/models/${chosen}:generateContent`, {}, apiKey)
 
     const res = await fetch(
-      `${endpointFor(chosen, 'generateContent')}?key=${encodeURIComponent(apiKey)}`,
+      url,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         signal,
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
@@ -452,7 +477,8 @@ export const geminiProvider: Provider = {
   },
 
   async chat(input: ChatInput, { apiKey, model, signal }, onDelta): Promise<string> {
-    if (!apiKey) throw new GeminiError('No API key set. Add one in Settings.')
+    if (!apiKey && !usingProxy())
+      throw new GeminiError('No API key set. Add one in Settings.')
     const chosen = model || DEFAULT_MODEL
 
     // The sheet and the report ride along on the first turn, so every answer is
@@ -472,11 +498,17 @@ export const geminiProvider: Provider = {
       ...input.messages.map((m) => ({ role: m.role, parts: [{ text: m.text }] })),
     ]
 
+    const { url, headers } = route(
+      `/models/${chosen}:streamGenerateContent`,
+      { alt: 'sse' },
+      apiKey,
+    )
+
     const res = await fetch(
-      `${endpointFor(chosen, 'streamGenerateContent')}?alt=sse&key=${encodeURIComponent(apiKey)}`,
+      url,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         signal,
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: CHAT_SYSTEM_PROMPT }] },

@@ -1,0 +1,14 @@
+name = "schematicanalyzer-proxy"
+main = "index.js"
+compatibility_date = "2026-07-31"
+
+# The origins allowed to call this proxy. Anything else gets a 403 rather than
+# an opaque CORS failure. Not a secret, so it lives here rather than in a
+# secret — it is a convenience, not the security boundary. The passphrase is.
+[vars]
+ALLOWED_ORIGIN = "https://bigmoney21682-hub.github.io"
+
+# GEMINI_KEY and APP_TOKEN are secrets, deliberately absent from this file.
+# Set them with:
+#   npx wrangler secret put GEMINI_KEY
+#   npx wrangler secret put APP_TOKEN

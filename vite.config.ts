@@ -9,6 +9,18 @@ import { VitePWA } from 'vite-plugin-pwa'
 const root = dirname(fileURLToPath(import.meta.url))
 
 /**
+ * Where the built app will be served from.
+ *
+ * A relative base is the default because it works from any subpath without a
+ * rebuild. GitHub Pages project sites need the real path anyway: the service
+ * worker's navigation fallback and the manifest's scope are resolved against
+ * the origin, not against the page, so './' would scope the PWA to the domain
+ * root and the installed app would open a 404. CI sets BASE_PATH=/<repo>/.
+ */
+const base = process.env.BASE_PATH ?? './'
+const relativeBase = base === './'
+
+/**
  * Phones reach the dev server by LAN IP, which isn't a secure context over
  * plain http — no service worker, no install prompt, no crypto.randomUUID.
  * A self-signed cert buys those back. Off by default: localhost is already
@@ -54,9 +66,7 @@ function pdfjsAssets(): Plugin {
 }
 
 export default defineConfig({
-  // Relative base so the built app works from a subpath as well as from a
-  // domain root, without needing a rebuild.
-  base: './',
+  base,
 
   server: {
     // Deliberately clear of the other dev servers on this machine (3000, 5000,
@@ -97,8 +107,8 @@ export default defineConfig({
         background_color: '#070b12',
         display: 'standalone',
         orientation: 'any',
-        start_url: './',
-        scope: './',
+        start_url: base,
+        scope: base,
         icons: [
           { src: 'icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
           { src: 'icon-maskable.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'maskable' },
@@ -124,7 +134,10 @@ export default defineConfig({
             },
           },
         ],
-        navigateFallback: 'index.html',
+        // Left bare under a relative base: workbox resolves this against the
+        // service worker's own scope, and a leading './' there is not the same
+        // thing as the served path.
+        navigateFallback: relativeBase ? 'index.html' : `${base}index.html`,
       },
     }),
   ],

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { diagnoseKey, sanitizeKey } from '../lib/apikey'
 import { modelListers, pickDefaultModel, providers } from '../lib/providers'
+import { proxyStore } from '../lib/proxy'
 import { apiKeyStore, modelStore, providerStore } from '../lib/storage'
 
 interface Props {
@@ -28,6 +29,7 @@ export function Settings({ onClose, onChange }: Props) {
   const [model, setModel] = useState(() => modelStore.get(providerStore.get()))
   const [reveal, setReveal] = useState(false)
   const [test, setTest] = useState<TestState>({ status: 'idle' })
+  const [proxy, setProxy] = useState(() => proxyStore.get())
 
   // Switching provider swaps in that provider's own stored key and model.
   useEffect(() => {
@@ -41,10 +43,12 @@ export function Settings({ onClose, onChange }: Props) {
   const lister = modelListers[providerId]
 
   const diagnostic = diagnoseKey(providerId, apiKey)
+  // With a proxy in front, the key lives on the Worker and this browser has none.
+  const proxied = Boolean(proxy.url.trim())
 
   async function runTest() {
     const clean = sanitizeKey(apiKey)
-    if (!lister || !clean) return
+    if (!lister || (!clean && !proxied)) return
     setTest({ status: 'testing' })
     try {
       const models = await lister(clean)
@@ -61,6 +65,7 @@ export function Settings({ onClose, onChange }: Props) {
     providerStore.set(providerId)
     apiKeyStore.set(providerId, apiKey)
     modelStore.set(providerId, model)
+    proxyStore.set(proxy)
     onChange(providerId, sanitizeKey(apiKey), model)
     onClose()
   }
@@ -117,9 +122,13 @@ export function Settings({ onClose, onChange }: Props) {
             <button
               className="btn btn--ghost btn--wide"
               onClick={runTest}
-              disabled={!sanitizeKey(apiKey) || test.status === 'testing'}
+              disabled={(!sanitizeKey(apiKey) && !proxied) || test.status === 'testing'}
             >
-              {test.status === 'testing' ? 'Testing…' : 'Test key & list models'}
+              {test.status === 'testing'
+                ? 'Testing…'
+                : proxied
+                  ? 'Test proxy & list models'
+                  : 'Test key & list models'}
             </button>
 
             {test.status === 'ok' && (
@@ -181,6 +190,54 @@ export function Settings({ onClose, onChange }: Props) {
               models. A paid key does not. Check the terms before uploading anything confidential —
               service manuals are usually somebody's copyright.
             </p>
+
+            <label className="field">
+              <span className="field__label">Proxy URL (optional)</span>
+              <input
+                type="url"
+                value={proxy.url}
+                onChange={(e) => {
+                  setProxy((p) => ({ ...p, url: e.target.value }))
+                  setTest({ status: 'idle' })
+                }}
+                placeholder="https://schematicanalyzer-proxy.you.workers.dev"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+              />
+              <span className="field__help">
+                Leave blank to talk to Google directly with the key above — no sheet ever touches
+                another server. Fill it in and the proxy supplies the key instead, so this browser
+                needs none. Every sheet then passes through whoever runs that proxy.
+              </span>
+            </label>
+
+            {proxied && (
+              <label className="field">
+                <span className="field__label">Proxy passphrase</span>
+                <input
+                  type={reveal ? 'text' : 'password'}
+                  value={proxy.token}
+                  onChange={(e) => setProxy((p) => ({ ...p, token: e.target.value }))}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                />
+                <span className="field__help">
+                  Must match the proxy's APP_TOKEN. Without it the proxy refuses every request —
+                  which is the point, since an open proxy spends its owner's quota.
+                </span>
+              </label>
+            )}
+
+            {proxied && (
+              <p className="field__help field__help--warn">
+                The proxy is in use, so the API key above is ignored. Clear the URL to go back to
+                talking to Google directly.
+              </p>
+            )}
           </>
         )}
 

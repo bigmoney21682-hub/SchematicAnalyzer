@@ -169,6 +169,7 @@ src/
     pdf.ts              PDF loading and page rendering (lazy-loaded)
     storage.ts          key, model, provider and saved reports
     apikey.ts           key sanitising and diagnostics
+    proxy.ts            optional Worker proxy settings
     providers/
       gemini.ts         structured output, streaming chat, model listing
       mock.ts           demo mode
@@ -180,7 +181,9 @@ src/
     Diagram.tsx         the block diagram
     Chat.tsx            follow-up questions
     History.tsx         saved reports
-    Settings.tsx        provider, key, model
+    Settings.tsx        provider, key, model, proxy
+worker/
+  index.js              optional Cloudflare Worker holding the shared key
 ```
 
 The previous version of this project — a rules/OCR/tracing pipeline that drew an overlay on
@@ -188,6 +191,22 @@ top of the scan — is on the `legacy-rules-pipeline` branch.
 
 ## Deploying
 
-`base: './'` is set, so the build is path-independent: it runs from a domain root or a
-subpath without a rebuild. It is a pure static site — `npm run build` and serve `dist/`
-anywhere.
+Pushing to `main` builds and publishes to GitHub Pages via `.github/workflows/deploy.yml`.
+Enable Pages with source **GitHub Actions** in the repo settings once; after that every push
+redeploys.
+
+It is a pure static site otherwise — `npm run build` and serve `dist/` anywhere. The base
+path defaults to `./`, which is path-independent; CI sets `BASE_PATH=/<repo>/` because the
+service worker's scope and navigation fallback are resolved against the origin rather than
+the page, and a relative base would scope the installed PWA to the domain root.
+
+The 3.9 MB of pdf.js fonts, CJK maps and wasm decoders are copied out of `node_modules` at
+build time by a plugin in `vite.config.ts`, so they ship without being committed.
+
+### Sharing the link without sharing a key
+
+By default each visitor supplies their own Gemini key. `worker/` is a Cloudflare Worker that
+holds one key server-side and gates access with a passphrase, so a link can be handed to
+someone who has no key of their own. Deploy it, then fill in **Settings → Proxy URL** and the
+passphrase. Every sheet then passes through your Cloudflare account and spends your quota —
+see `worker/README.md` before you deploy it.

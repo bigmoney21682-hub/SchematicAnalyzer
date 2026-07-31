@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { getProvider } from '../lib/providers'
+import { usingProxy } from '../lib/proxy'
 import type { Analysis, ChatMessage } from '../lib/types'
 
 interface Props {
@@ -64,7 +65,7 @@ export function Chat({
     if (!question || busy || !image) return
 
     const provider = getProvider(providerId)
-    if (provider.needsKey && !apiKey) {
+    if (provider.needsKey && !apiKey && !usingProxy()) {
       setError('Add an API key in Settings first, or switch to Demo mode.')
       return
     }
