@@ -1,25 +1,26 @@
 {
   "name": "schematic-analyzer",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:lan": "HTTPS=1 vite --host",
     "build": "tsc -b && vite build",
-    "start": "node server/index.mjs",
+    "preview": "vite preview",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "typecheck": "tsc -b --noEmit"
   },
   "dependencies": {
     "pdfjs-dist": "^6.1.200",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7",
-    "tesseract.js": "^7.0.0"
+    "react-dom": "^19.2.7"
   },
   "devDependencies": {
     "@types/node": "^24.13.2",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-basic-ssl": "^2.1.0",
     "@vitejs/plugin-react": "^6.0.3",
     "oxlint": "^1.71.0",
     "typescript": "~6.0.2",
