@@ -14,11 +14,12 @@
  *    schematic rendered onto transparency is black lines on nothing — which
  *    encodes to black-on-black the moment it hits a JPEG.
  */
+// Must come first: pdf.js calls a handful of very recent JS methods unguarded,
+// and on iOS Safari the failure is an opaque "getOrInsertComputed is not a
+// function" before a single page renders.
+import './compat'
 import * as pdfjs from 'pdfjs-dist'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
-import workerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url'
-
-pdfjs.GlobalWorkerOptions.workerSrc = workerUrl
 
 /**
  * pdf.js ships its character maps and standard fonts as loose files and refuses
@@ -70,10 +71,26 @@ export interface LoadedPdf {
 export async function loadPdf(file: File): Promise<LoadedPdf> {
   const data = new Uint8Array(await file.arrayBuffer())
 
+  // Our own worker module, which installs the same shims worker-side. Only if
+  // the browser refuses a module worker do we fall back to the stock one, which
+  // misses the shims — but that beats failing outright, and nothing we support
+  // is expected to take that path.
+  let worker: Worker | null = null
+  try {
+    worker = new Worker(new URL('./pdf-worker.ts', import.meta.url), { type: 'module' })
+    pdfjs.GlobalWorkerOptions.workerPort = worker
+  } catch {
+    pdfjs.GlobalWorkerOptions.workerPort = null
+    pdfjs.GlobalWorkerOptions.workerSrc = (
+      await import('pdfjs-dist/build/pdf.worker.mjs?url')
+    ).default
+  }
+
   let doc: PDFDocumentProxy
   try {
     doc = await pdfjs.getDocument({ data, ...DOC_OPTIONS }).promise
   } catch (e) {
+    worker?.terminate()
     const message = e instanceof Error ? e.message : ''
     if (/password/i.test(message))
       throw new Error('This PDF is password-protected. Unlock it and try again.')
@@ -96,7 +113,15 @@ export async function loadPdf(file: File): Promise<LoadedPdf> {
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, canvas.width, canvas.height)
 
-    await page.render({ canvas, canvasContext: ctx, viewport }).promise
+    // 'print', not the default 'display'. Nothing here paints a PDF to the
+    // screen — every render is an offscreen rasterisation whose pixels are then
+    // copied out. That matters because for the display intent pdf.js drives its
+    // render loop with requestAnimationFrame, which a browser does not fire for
+    // a hidden tab: switch apps on a phone while a page is rendering, which is
+    // the normal thing to do while waiting, and the render stops dead with no
+    // error and no timeout. The print intent schedules without rAF and finishes
+    // whether the tab is on screen or not.
+    await page.render({ canvas, canvasContext: ctx, viewport, intent: 'print' }).promise
     page.cleanup()
     return canvas
   }
@@ -128,9 +153,18 @@ export async function loadPdf(file: File): Promise<LoadedPdf> {
     },
 
     close() {
-      // Teardown lives on the loading task, not the document: destroying it is
-      // what actually terminates the worker and frees the file's buffer.
-      doc.loadingTask.destroy().catch(() => {})
+      // Teardown lives on the loading task, not the document. And a
+      // port-provided worker is pdf.js's to talk to but ours to shut down — it
+      // only terminates workers it spawned itself, so one would leak per PDF.
+      doc.loadingTask
+        .destroy()
+        .catch(() => {})
+        .finally(() => {
+          if (pdfjs.GlobalWorkerOptions.workerPort === worker) {
+            pdfjs.GlobalWorkerOptions.workerPort = null
+          }
+          worker?.terminate()
+        })
     },
   }
 }
