@@ -142,9 +142,9 @@ export function Settings({ onClose, onChange }: Props) {
             {test.status === 'ok' && (
               <div className="test test--ok">
                 <strong>Key works.</strong> {test.models.length} model
-                {test.models.length === 1 ? '' : 's'} available. Picked the strongest one, because
-                reading 7px designators off a scan is where the models differ most — change it
-                below if you prefer.
+                {test.models.length === 1 ? '' : 's'} available. Picked a Flash model: on a free
+                key it answers where Pro is usually rate limited. Pro reads 7px designators off a
+                scan better — pick it below if your key is paid, or if a sheet comes back wrong.
               </div>
             )}
 
