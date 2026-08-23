@@ -3,14 +3,20 @@ main = "index.js"
 compatibility_date = "2026-07-31"
 
 # The origins allowed to call this proxy. Anything else gets a 403 rather than
-# an opaque CORS failure. Not a secret, so it lives here rather than in a
-# secret — with the passphrase optional, this is the main gate, so keep it
-# tight and never set it to "*".
+# an opaque CORS failure.
+#
+# Worth being honest about what this is: it stops *other websites* from
+# spending the pool through a visitor's browser, which is the attack a browser
+# can actually mount. It stops nothing from curl, which sets any Origin it
+# likes. The daily cap is the limit that holds against a script.
+#
+# Local entries are this app's own dev server (5190) and vite preview
+# (4173). Both http and https, because `npm run dev:lan` serves TLS; and
+# 127.0.0.1 alongside localhost, because the browser treats them as different
+# origins. Never set this to "*".
 [vars]
-ALLOWED_ORIGIN = "https://bigmoney21682-hub.github.io"
+ALLOWED_ORIGIN = "https://bigmoney21682-hub.github.io,http://localhost:5190,http://127.0.0.1:5190,https://localhost:5190,http://localhost:4173,http://127.0.0.1:4173,https://localhost:4173"
 
-# Requests per IP per day through the shared key pool. Only enforced when the
-# RATE_LIMIT namespace below is bound.
 DAILY_CAP = "40"
 
 # Per-IP request counters. Without this binding there is no cap at all, which
