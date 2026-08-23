@@ -66,8 +66,8 @@ function resolveUpstream(pathname) {
   return { name: 'google', up: UPSTREAMS.google, path: pathname }
 }
 
-/** A scanned sheet plus a prompt, base64'd. Anything larger is not a page of
- *  a service manual, and is the cheapest abuse to refuse. */
+/** An image plus a prompt, base64'd. Anything larger is not a photo of a study
+ *  and is the cheapest abuse to refuse. */
 const MAX_BODY_BYTES = 12 * 1024 * 1024
 
 /** Requests per IP per rolling day, enforced only when a RATE_LIMIT KV
@@ -141,12 +141,16 @@ function fail(status, message, request, env, extra = {}) {
  * start the first key absorbs every request and hits its daily cap alone while
  * the others sit idle, which is the opposite of what a pool is for.
  */
-function keyPool(up, env) {
-  const keys = up
+function poolFor(up, env) {
+  return up
     .keys(env)
     .flatMap((v) => (v ?? '').split(/[\s,]+/))
     .map((k) => k.trim())
     .filter(Boolean)
+}
+
+function keyPool(up, env) {
+  const keys = poolFor(up, env)
 
   if (keys.length < 2) return keys
   const start = Math.floor(Math.random() * keys.length)
@@ -220,6 +224,55 @@ function quotaHeaders(q) {
   }
 }
 
+/**
+ * What is in the key pools, without revealing what the keys are.
+ *
+ * Setting a pool is the step that goes wrong: `wrangler secret put` replaces
+ * the value rather than appending to it, so a key silently vanishes from one
+ * Worker and not the others, or the same key gets pasted twice and looks like
+ * two. Neither shows up as an error — the proxy keeps working on a thinner
+ * pool than you think you have.
+ *
+ * A four-byte SHA-256 prefix is enough to spot both. It cannot be reversed
+ * into a 39-to-53-character high-entropy key, and identical keys hash
+ * identically, which is exactly the property needed.
+ *
+ * Deliberately makes no upstream calls. An endpoint that fans one request out
+ * into one-per-key would be a neat amplifier for anyone who can reach it, and
+ * liveness is what the app's own Test button is for.
+ */
+async function keyReport(env) {
+  const out = {}
+
+  for (const [name, up] of Object.entries(UPSTREAMS)) {
+    const keys = poolFor(up, env)
+    const seen = new Map()
+
+    const entries = await Promise.all(
+      keys.map(async (k) => {
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(k))
+        const fp = [...new Uint8Array(digest)]
+          .slice(0, 4)
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join('')
+        seen.set(fp, (seen.get(fp) ?? 0) + 1)
+        return { fp, prefix: k.slice(0, 4), length: k.length }
+      }),
+    )
+
+    const duplicates = [...seen].filter(([, n]) => n > 1).map(([fp]) => fp)
+    out[name] = {
+      secret: up.label,
+      count: entries.length,
+      distinct: seen.size,
+      duplicates,
+      keys: entries.map((e) => ({ ...e, duplicate: duplicates.includes(e.fp) })),
+    }
+  }
+
+  return out
+}
+
 export default {
   async fetch(request, env) {
     const cors = corsHeaders(request, env)
@@ -231,7 +284,27 @@ export default {
     if (!cors['Access-Control-Allow-Origin'])
       return fail(403, 'This proxy does not serve that origin. Check ALLOWED_ORIGIN.', request, env)
 
+    // The gate is optional. Set APP_TOKEN and the app must present it; leave
+    // it unset and the origin allowlist plus the daily cap are the only
+    // limits, which is the right trade for a proxy meant to serve a public
+    // app to people who have no key of their own.
+    //
+    // Checked before anything else answers, so a tokened deployment does not
+    // leak its allowance or its pool shape to an unauthenticated caller.
+    if (env.APP_TOKEN) {
+      const token = request.headers.get('X-App-Token') ?? ''
+      if (!token || !(await safeEqual(token, env.APP_TOKEN)))
+        return fail(401, 'Wrong or missing passphrase for this proxy.', request, env)
+    }
+
     const url = new URL(request.url)
+
+    // What is in the key pools. Costs nothing and reveals nothing — see
+    // keyReport. Answered before the vendor routing because it spans vendors.
+    if (url.pathname === '/keycheck')
+      return new Response(JSON.stringify(await keyReport(env), null, 2), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors },
+      })
 
     // The allowance, readable without spending any of it. The app calls this
     // on load so the homescreen can show what is left before anyone uploads
@@ -245,16 +318,6 @@ export default {
 
     const keys = keyPool(up, env)
     if (!keys.length) return fail(500, `The proxy has no ${up.label} secret set.`, request, env)
-
-    // The gate is optional. Set APP_TOKEN and the app must present it; leave
-    // it unset and the origin allowlist plus the daily cap are the only
-    // limits, which is the right trade for a proxy meant to serve a public
-    // app to people who have no key of their own.
-    if (env.APP_TOKEN) {
-      const token = request.headers.get('X-App-Token') ?? ''
-      if (!token || !(await safeEqual(token, env.APP_TOKEN)))
-        return fail(401, 'Wrong or missing passphrase for this proxy.', request, env)
-    }
 
     if (!up.paths.some((re) => re.test(path)))
       return fail(404, `This proxy does not forward ${url.pathname}.`, request, env)
