@@ -263,6 +263,16 @@ export interface AnalyzeOptions {
    *  from what the key can actually reach rather than hardcoded. */
   model?: string
   signal?: AbortSignal
+  /** Fires with the model that actually answered. Usually the one asked for,
+   *  but the fallback chain moves on when a model is retired or rate-limited,
+   *  and a report has to be attributed to whichever model wrote it. */
+  onModel?: (model: string) => void
+  /** Fires with the credential that actually worked — the viewer's own key,
+   *  their proxy, or the shared pool. Lets the UI say whose quota was spent. */
+  onCredential?: (cred: { kind: string; label: string }) => void
+  /** Fires with the vendor actually being used, so a report can say it came
+   *  from Groq when every Gemini key was spent. */
+  onProvider?: (providerId: string) => void
 }
 
 export interface ChatMessage {

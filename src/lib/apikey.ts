@@ -46,5 +46,14 @@ export function diagnoseKey(providerId: string, raw: string): KeyDiagnostic | nu
     return { level: 'ok', message: `${clean.length} characters, well-formed.` }
   }
 
+  if (providerId === 'groq') {
+    if (!clean.startsWith('gsk_'))
+      return {
+        level: 'error',
+        message: `Groq keys begin with "gsk_". This one begins with "${clean.slice(0, 4)}".`,
+      }
+    return { level: 'ok', message: `${clean.length} characters, well-formed.` }
+  }
+
   return null
 }

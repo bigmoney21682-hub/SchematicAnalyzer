@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { getProvider } from '../lib/providers'
+import { chat as runChat, getProvider } from '../lib/providers'
 import { usingProxy } from '../lib/proxy'
 import type { Analysis, ChatMessage } from '../lib/types'
 
@@ -81,7 +81,8 @@ export function Chat({
     let partial = ''
 
     try {
-      const answer = await provider.chat(
+      const answer = await runChat(
+        providerId,
         {
           imageBase64: image.base64,
           mimeType: image.mimeType,

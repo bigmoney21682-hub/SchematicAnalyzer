@@ -4,8 +4,10 @@ Upload a schematic. Get a block diagram of the circuit, every supply rail and wh
 comes from, which grounds are actually the same net, what each LED means, and where to put
 a probe — then ask follow-up questions about the sheet.
 
-Everything runs in the browser against your own Gemini key. There is no backend and
-nothing passes through the host serving the app.
+Everything runs in the browser. With your own Gemini key nothing passes through the host
+serving the app — the sheet goes straight to Google. Without one, the deployed app falls
+back to a shared service (see **Keys and fallbacks** below), and Demo mode needs no
+network at all.
 
 ```bash
 npm install
@@ -142,13 +144,44 @@ value.
 
 ---
 
-## Your key
+## Keys and fallbacks
 
-Stored in this browser's `localStorage`, sent only to Google's endpoint. Because this is a
-static site the key is readable by anything running in the browser — restrict it by referrer
-and rotate it if you share the device. A free-tier AI Studio key lets Google train on what
-you send it; a paid key does not, which matters when service manuals are usually somebody's
-copyright.
+Three nested chains. They are separate because they fail for unrelated reasons, and
+none of them can fix another's problem.
+
+**Credentials** — tried in order, skipping any that is missing or out of quota:
+
+1. **Your key**, browser-to-vendor. Nothing touches a server we run.
+2. **Your proxy**, if you deployed `worker/` yourself.
+3. **The shared service** — pools of keys held by the app owner's Worker, rate limited
+   per IP. Untick it in Settings to guarantee no sheet leaves the browser except to the
+   vendor.
+
+So a key of your own both *overrides* the shared pool and *extends* it: yours is spent
+first, and the shared one only picks up when yours is exhausted.
+
+**Models** — within each credential, a retired or rate-limited model falls through to
+the next best one that credential can reach, up to five, ranked by `providers/rank.ts`.
+
+**Vendors** — when Gemini is unusable outright, Groq picks it up. Groq sends no CORS
+headers, so it is reachable only through the proxy; a Groq key typed into a static site
+cannot work, and the app says so rather than showing "Failed to fetch".
+
+The whole thing is capped at seven upstream calls, so a bad day surfaces as an error
+rather than a long silence. It never falls back to Demo mode — a report always comes
+from a real model, and a banner names the model and vendor whenever they were not the
+ones Settings names. Faults no other model or key would fix (a bad key, a safety block)
+stop on the first request instead of burning six more to prove it.
+
+**The shared allowance** is shown on the landing screen when you are using it: the
+Worker reports what is left of the daily per-IP cap, so the number is the server's
+count rather than a guess this browser keeps.
+
+Your key is stored in this browser's `localStorage` and sent only to Google's endpoint.
+Because this is a static site the key is readable by anything running in the browser —
+restrict it by referrer and rotate it if you share the device. A free-tier AI Studio key
+lets Google train on what you send it; a paid key does not, which matters when service
+manuals are usually somebody's copyright.
 
 The key diagnostics in Settings catch the common failure before it costs you a request:
 pasting a key on a phone picks up trailing newlines and zero-width characters remarkably
@@ -169,11 +202,15 @@ src/
     pdf.ts              PDF loading and page rendering (lazy-loaded)
     storage.ts          key, model, provider and saved reports
     apikey.ts           key sanitising and diagnostics
-    proxy.ts            optional Worker proxy settings
+    proxy.ts            credential chain + shared-allowance store
     providers/
       gemini.ts         structured output, streaming chat, model listing
       mock.ts           demo mode
-      index.ts          registry and model ranking
+      groq.ts           second vendor, OpenAI-compatible, proxy-only
+      index.ts          registry + the vendor-level fallback
+      rank.ts           model ranking, shared with the fallback chain
+      fallback.ts       retry across models, then across credentials
+      shape.ts          normalising a report, whichever vendor wrote it
   components/
     Capture.tsx         landing screen and file input
     PdfPicker.tsx       page picker for PDFs
@@ -181,7 +218,8 @@ src/
     Diagram.tsx         the block diagram
     Chat.tsx            follow-up questions
     History.tsx         saved reports
-    Settings.tsx        provider, key, model, proxy
+    Settings.tsx        provider, key, model, proxy, shared service
+    Quota.tsx           what is left of the shared daily allowance
 worker/
   index.js              optional Cloudflare Worker holding the shared key
 ```

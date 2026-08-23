@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { diagnoseKey, sanitizeKey } from '../lib/apikey'
 import { modelListers, pickDefaultModel, providers } from '../lib/providers'
-import { proxyStore } from '../lib/proxy'
+import { proxyStore, sharedProxyStore } from '../lib/proxy'
 import { apiKeyStore, modelStore, providerStore } from '../lib/storage'
 
 interface Props {
@@ -21,6 +21,11 @@ const KEY_HELP: Record<string, { url: string; label: string; placeholder: string
     label: 'aistudio.google.com/apikey',
     placeholder: 'AIza...',
   },
+  groq: {
+    url: 'https://console.groq.com/keys',
+    label: 'console.groq.com/keys',
+    placeholder: 'gsk_...',
+  },
 }
 
 export function Settings({ onClose, onChange }: Props) {
@@ -30,6 +35,7 @@ export function Settings({ onClose, onChange }: Props) {
   const [reveal, setReveal] = useState(false)
   const [test, setTest] = useState<TestState>({ status: 'idle' })
   const [proxy, setProxy] = useState(() => proxyStore.get())
+  const [useShared, setUseShared] = useState(() => sharedProxyStore.get())
 
   // Switching provider swaps in that provider's own stored key and model.
   useEffect(() => {
@@ -43,12 +49,13 @@ export function Settings({ onClose, onChange }: Props) {
   const lister = modelListers[providerId]
 
   const diagnostic = diagnoseKey(providerId, apiKey)
-  // With a proxy in front, the key lives on the Worker and this browser has none.
   const proxied = Boolean(proxy.url.trim())
+  // Something can serve a request even with no key in this browser.
+  const covered = Boolean(sanitizeKey(apiKey)) || proxied || useShared
 
   async function runTest() {
     const clean = sanitizeKey(apiKey)
-    if (!lister || (!clean && !proxied)) return
+    if (!lister || !covered) return
     setTest({ status: 'testing' })
     try {
       const models = await lister(clean)
@@ -66,6 +73,7 @@ export function Settings({ onClose, onChange }: Props) {
     apiKeyStore.set(providerId, apiKey)
     modelStore.set(providerId, model)
     proxyStore.set(proxy)
+    sharedProxyStore.set(useShared)
     onChange(providerId, sanitizeKey(apiKey), model)
     onClose()
   }
@@ -122,7 +130,7 @@ export function Settings({ onClose, onChange }: Props) {
             <button
               className="btn btn--ghost btn--wide"
               onClick={runTest}
-              disabled={(!sanitizeKey(apiKey) && !proxied) || test.status === 'testing'}
+              disabled={!covered || test.status === 'testing'}
             >
               {test.status === 'testing'
                 ? 'Testing…'
@@ -207,9 +215,9 @@ export function Settings({ onClose, onChange }: Props) {
                 spellCheck={false}
               />
               <span className="field__help">
-                Leave blank to talk to Google directly with the key above — no sheet ever touches
-                another server. Fill it in and the proxy supplies the key instead, so this browser
-                needs none. Every sheet then passes through whoever runs that proxy.
+                Your own deployment of worker/, for a team that wants a shared key without a
+                shared operator. Used only when the key above is missing or exhausted. Every sheet
+                sent this way passes through whoever runs that proxy.
               </span>
             </label>
 
@@ -232,10 +240,42 @@ export function Settings({ onClose, onChange }: Props) {
               </label>
             )}
 
-            {proxied && (
+            {sharedProxyStore.available() && (
+              <label className="field field--check">
+                <input
+                  type="checkbox"
+                  checked={useShared}
+                  onChange={(e) => {
+                    setUseShared(e.target.checked)
+                    setTest({ status: 'idle' })
+                  }}
+                />
+                <span>
+                  <span className="field__label">Use the shared service</span>
+                  <span className="field__help">
+                    Lets this app work with no key of your own, on a pool of keys the app's owner
+                    pays for — so it is rate limited, and every sheet passes through their server.
+                    A key of your own is used first and the shared pool only picks up when yours
+                    is exhausted. Untick this to guarantee no sheet leaves this browser except to
+                    Google.
+                  </span>
+                </span>
+              </label>
+            )}
+
+            <p className="field__help">
+              <strong>Order of use:</strong> your key, then your proxy, then the shared service —
+              whichever is set. Each is skipped when it is out of quota rather than failing the
+              request. Within each, a retired or rate-limited model falls through to the next best
+              one that credential can reach; and if a whole vendor is unusable, the other one picks
+              it up. Nothing ever falls back to Demo mode — a report always comes from a real
+              model, and the banner above says which one when it was not the one named here.
+            </p>
+
+            {!covered && (
               <p className="field__help field__help--warn">
-                The proxy is in use, so the API key above is ignored. Clear the URL to go back to
-                talking to Google directly.
+                Nothing is set to serve a request. Add a key above, point at a proxy, or turn the
+                shared service on — otherwise only Demo mode will run.
               </p>
             )}
           </>

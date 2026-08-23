@@ -1393,6 +1393,82 @@ a {
   white-space: pre-line;
 }
 
+/* ---------- shared-service allowance ---------- */
+.quota {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 16px;
+}
+
+.quota__line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.quota__label {
+  color: var(--muted);
+}
+
+.quota__count strong {
+  font-size: 15px;
+  color: var(--text);
+}
+
+.quota__bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden;
+  margin: 8px 0 0;
+}
+
+.quota__fill {
+  height: 100%;
+  background: var(--accent);
+  /* Animated so a fallback that spends a request is visible rather than a
+     silent jump the next time the page happens to re-render. */
+  transition: width 240ms ease;
+}
+
+.quota--spent .quota__fill {
+  background: var(--danger);
+}
+
+.quota__note {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+/* Not a failure — the report exists, it just came from a different model or
+   key than Settings names. Blue rather than red so it doesn't read as an
+   error. */
+.alert--info {
+  background: #131f2b;
+  border-color: #2c4661;
+  color: #b9d4ee;
+}
+
+/* A checkbox and its explanation side by side, so the label text can run to
+   several lines without wrapping under the box. */
+.field--check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.field--check input {
+  width: auto;
+  margin-top: 3px;
+  flex: none;
+}
+
 .alert--inline {
   margin: 0 0 10px;
   font-size: 13.5px;

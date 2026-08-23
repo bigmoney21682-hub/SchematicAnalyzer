@@ -3,11 +3,12 @@ import { Capture } from './components/Capture'
 import { Chat } from './components/Chat'
 import { History } from './components/History'
 import { PdfPicker } from './components/PdfPicker'
+import { Quota } from './components/Quota'
 import { Results } from './components/Results'
 import { Settings } from './components/Settings'
 import { formatBytes, prepareImage, type PreparedImage } from './lib/image'
 import type { LoadedPdf } from './lib/pdf'
-import { getProvider } from './lib/providers'
+import { analyze as runAnalysis, getProvider, providers } from './lib/providers'
 import { usingProxy } from './lib/proxy'
 import { apiKeyStore, historyStore, modelStore, providerStore } from './lib/storage'
 import type { Analysis, ChatMessage } from './lib/types'
@@ -27,6 +28,9 @@ export default function App() {
   // Which history row the live report was saved as, so follow-ups land on it.
   const [entryId, setEntryId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Set when the fallback chain had to leave the chosen model or key behind. A
+  // report written by something other than what Settings names must say so.
+  const [notice, setNotice] = useState<string | null>(null)
   const [showSettings, setShowSettings] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
   const [providerId, setProviderId] = useState(providerStore.get())
@@ -118,18 +122,51 @@ export default function App() {
     abortRef.current = controller
     setStage('analyzing')
     setError(null)
+    setNotice(null)
+
+    const asked = model || provider.defaultModel
+    let used = asked
+    // Which of the credential sources actually paid for this. Only worth
+    // mentioning when it was not the obvious one.
+    let via = ''
+
+    let vendor = providerId
 
     try {
-      const result = await provider.analyze(
+      const result = await runAnalysis(
+        providerId,
         { imageBase64: image.base64, mimeType: image.mimeType, hint },
-        { apiKey, model, signal: controller.signal },
+        {
+          apiKey,
+          model,
+          signal: controller.signal,
+          onModel: (m) => {
+            used = m
+          },
+          onCredential: (c) => {
+            via = c.kind === 'own' ? '' : c.label
+          },
+          onProvider: (id) => {
+            vendor = id
+          },
+        },
       )
       setAnalysis(result)
       setChat([])
+      const vendorName = providers.find((p) => p.id === vendor)?.label ?? vendor
+      const moved = [
+        vendor !== providerId && `${provider.label} could not run this sheet, so ${vendorName} did`,
+        vendor === providerId &&
+          used !== asked &&
+          `${asked} could not run this sheet, so ${used} wrote this report`,
+        via && apiKey && `your key was exhausted, so it ran on ${via}`,
+      ].filter(Boolean)
+      if (moved.length)
+        setNotice(`${moved.join('; ')}. Check Settings if you want a specific model or key.`)
       const entry = historyStore.add({
         analysis: result,
-        provider: providerId,
-        model: model || provider.defaultModel,
+        provider: vendor,
+        model: used,
         hint,
         origin: image.origin,
         thumbnail: image.thumbnail,
@@ -170,6 +207,7 @@ export default function App() {
     setEntryId(null)
     setHint('')
     setError(null)
+    setNotice(null)
     setStage('idle')
     setShowHistory(false)
   }, [])
@@ -218,7 +256,18 @@ export default function App() {
             </div>
           )}
 
-          {stage === 'idle' && <Capture onPick={pick} />}
+          {notice && (
+            <div className="alert alert--info" role="status">
+              {notice}
+            </div>
+          )}
+
+          {stage === 'idle' && (
+            <>
+              <Quota hasOwnKey={Boolean(apiKey)} />
+              <Capture onPick={pick} />
+            </>
+          )}
 
           {stage === 'picking' && pdf && (
             <PdfPicker pdf={pdf} onPick={pickPage} onCancel={reset} busyPage={openingPage} />

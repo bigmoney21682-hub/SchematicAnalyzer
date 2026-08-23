@@ -4,11 +4,34 @@ compatibility_date = "2026-07-31"
 
 # The origins allowed to call this proxy. Anything else gets a 403 rather than
 # an opaque CORS failure. Not a secret, so it lives here rather than in a
-# secret — it is a convenience, not the security boundary. The passphrase is.
+# secret — with the passphrase optional, this is the main gate, so keep it
+# tight and never set it to "*".
 [vars]
 ALLOWED_ORIGIN = "https://bigmoney21682-hub.github.io"
 
-# GEMINI_KEY and APP_TOKEN are secrets, deliberately absent from this file.
-# Set them with:
-#   npx wrangler secret put GEMINI_KEY
+# Requests per IP per day through the shared key pool. Only enforced when the
+# RATE_LIMIT namespace below is bound.
+DAILY_CAP = "40"
+
+# Per-IP request counters. Without this binding there is no cap at all, which
+# is fine for a private URL and not fine for a published one. The namespace
+# title is per-account, hence the app-specific name; the binding the Worker
+# reads is always RATE_LIMIT. Each app counts separately, so a viewer gets a
+# full allowance in each rather than one pooled across all three.
+#   npx wrangler kv namespace create SCHEMATIC_RATE_LIMIT
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "5ca31452fa594c7aa9d24241cc960ae5"
+
+# The key pools are secrets, deliberately absent from this file: comma- or
+# newline-separated lists. The Worker rotates across each pool, so one key
+# running out of free quota does not take the shared link down.
+#   npx wrangler secret put GEMINI_KEYS   # AIza...,AIza...
+#   npx wrangler secret put GROQ_KEYS     # gsk_...,gsk_...   (optional)
+#
+# Without GROQ_KEYS the /groq routes return a 500 naming the missing secret and
+# the vendor fallback simply stops at Gemini. Without GEMINI_KEYS nothing works.
+#
+# APP_TOKEN is optional. Set it and the app must send a matching passphrase;
+# leave it unset and the origin allowlist plus DAILY_CAP are the only limits.
 #   npx wrangler secret put APP_TOKEN

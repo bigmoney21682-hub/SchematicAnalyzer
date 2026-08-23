@@ -1,40 +1,22 @@
 import type { Analysis, AnalyzeInput, ChatInput, Provider } from '../types'
 import { CHAT_SYSTEM_PROMPT, SYSTEM_PROMPT, buildUserPrompt } from '../prompt'
-import { proxyStore, usingProxy } from '../proxy'
+import type { Credential } from '../proxy'
+import { credentials, quotaStore, route } from '../proxy'
+import { withFallbackChain } from './fallback'
+import { normalizeAnalysis } from './shape'
 
 /**
- * Google AI Studio (generativelanguage) supports CORS, so by default we call it
- * straight from the browser with the user's own key. Nothing passes through the
- * host serving this app.
+ * Google AI Studio (generativelanguage) supports CORS, so a viewer with their
+ * own key is called browser-to-Google directly and no sheet touches a server
+ * we run. Where the credentials come from, and in what order, is proxy.ts's
+ * job; this file just takes the Credential it is handed.
  *
- * Configuring a proxy in Settings gives that up deliberately: one key, held by
- * the Worker, serves everyone who has the passphrase, and every sheet then
- * travels through whoever runs that Worker. Direct remains the default.
- *
- * Model IDs move around; if you get a 404 listing the model, check
- * https://ai.google.dev/gemini-api/docs/models and update DEFAULT_MODEL, or
- * just hit Test in Settings and pick from what the key can actually reach.
+ * Neither the model nor the credential is assumed to work. A retired model, a
+ * spent daily quota or a disabled project all get routed around by the chain
+ * in fallback.ts rather than surfacing as a dead end, so DEFAULT_MODEL here is
+ * a starting point rather than a dependency.
  */
 const DEFAULT_MODEL = 'gemini-flash-latest'
-const GOOGLE_ROOT = 'https://generativelanguage.googleapis.com/v1beta'
-
-/**
- * Builds the URL and auth headers for one call. Direct mode puts the user's key
- * in the query string; proxy mode sends the shared passphrase and lets the
- * Worker attach the key. Everything downstream — friendlyError, the response
- * schema, readSse — is identical either way, which is why the proxy is a URL
- * swap rather than a whole second provider.
- */
-function route(path: string, params: Record<string, string>, apiKey = '') {
-  const { url: proxy, token } = proxyStore.get()
-  const query = new URLSearchParams(params)
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-
-  if (proxy) headers['X-App-Token'] = token
-  else query.set('key', apiKey)
-
-  return { url: `${proxy || GOOGLE_ROOT}${path}?${query}`, headers }
-}
 
 const enumConfidence = { type: 'STRING', enum: ['high', 'medium', 'low'] }
 const enumEvidence = { type: 'STRING', enum: ['labelled', 'symbol', 'inferred', 'guess'] }
@@ -272,11 +254,14 @@ export class GeminiError extends Error {
   // A plain field rather than a constructor parameter property: the app
   // compiles with erasableSyntaxOnly, which rules out the shorthand.
   status?: number
+  /** Whether trying a different model or key is worth doing — see fallback.ts. */
+  retryable: boolean
 
-  constructor(message: string, status?: number) {
+  constructor(message: string, status?: number, retryable = false) {
     super(message)
     this.name = 'GeminiError'
     this.status = status
+    this.retryable = retryable
   }
 }
 
@@ -342,13 +327,46 @@ function friendlyError(status: number, body: string, model = DEFAULT_MODEL): str
 }
 
 /**
+ * Whether a different model could plausibly succeed where this one failed.
+ *
+ * The line to hold: faults that belong to the model are worth routing around,
+ * faults that belong to the key or the request are not. A 401, a disabled API,
+ * a restricted key or an oversized sheet will fail exactly the same way on
+ * every model in the list.
+ */
+function retryableStatus(status: number, body: string): boolean {
+  const detail = googleMessage(body)
+
+  // Retired, invisible to this key, or not multimodal — all per-model facts.
+  if (status === 404) return true
+  if (/no longer available|not found|is not supported|does not support/i.test(detail)) return true
+
+  // Free-tier quota is metered per model, so the next one down has its own.
+  if (status === 429) return true
+
+  // Capacity trouble is rarely uniform across the fleet.
+  if (status >= 500) return true
+
+  return false
+}
+
+/**
  * Lists models the key can reach. Doubles as a key test: it isolates "is this
  * key usable at all" from "is this specific model available", which the analyze
  * call alone can't distinguish.
  */
 export async function listGeminiModels(apiKey: string): Promise<string[]> {
-  const { url, headers } = route('/models', { pageSize: '200' }, apiKey)
+  const [first] = credentials('gemini', apiKey)
+  if (!first) throw new GeminiError('No API key set. Add one in Settings.')
+  return listModelsOn(first)
+}
+
+/** The same listing, on one specific credential — what the fallback chain
+ *  needs, since each credential can reach a different set of models. */
+async function listModelsOn(cred: Credential): Promise<string[]> {
+  const { url, headers } = route(cred, '/models', { pageSize: '200' })
   const res = await fetch(url, { headers })
+  quotaStore.readFrom(res)
   if (!res.ok) throw new GeminiError(friendlyError(res.status, await res.text().catch(() => '')))
   const json = await res.json()
   return (json?.models ?? [])
@@ -372,15 +390,175 @@ function blockMessage(reason: string): string {
   return `Request blocked by Google (${reason}).`
 }
 
+
+/** The chain to run, or a clear error if there is nothing in it. */
+function requireCredentials(apiKey: string | undefined): Credential[] {
+  const chain = credentials('gemini', apiKey)
+  if (!chain.length)
+    throw new GeminiError(
+      'No way to reach the model. Add your own API key in Settings, or turn the ' +
+        'shared service back on.',
+    )
+  return chain
+}
+
 /**
- * Drops connections whose endpoints don't exist. The model is told every edge
- * must reference a real block id and mostly complies, but one hallucinated
- * endpoint would otherwise put a phantom node in the diagram — and a diagram
- * that invents a block is worse than one that omits an edge.
+ * One analyze attempt against one model on one credential. Split out of the
+ * provider so the fallback chain can run it against each candidate in turn.
  */
-function pruneConnections(parsed: Analysis): Analysis['connections'] {
-  const ids = new Set((parsed.blocks ?? []).map((b) => b.id))
-  return (parsed.connections ?? []).filter((c) => ids.has(c.from) && ids.has(c.to) && c.from !== c.to)
+async function runAnalyze(
+  input: AnalyzeInput,
+  cred: Credential,
+  chosen: string,
+  signal: AbortSignal | undefined,
+): Promise<Analysis> {
+  const { url, headers } = route(cred, `/models/${chosen}:generateContent`)
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    signal,
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: buildUserPrompt(input.hint) },
+            { inline_data: { mime_type: input.mimeType, data: input.imageBase64 } },
+          ],
+        },
+      ],
+      safetySettings: SAFETY_SETTINGS,
+      generationConfig: {
+        // Near-deterministic. Reading designators off a sheet is a
+        // transcription task, and sampling breadth only invents values.
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+        responseSchema: RESPONSE_SCHEMA,
+      },
+    }),
+  })
+
+  // Proxied responses carry the shared allowance; direct ones carry nothing
+  // and this is a no-op. Read before the status check so a 429 still updates
+  // the meter that explains it.
+  quotaStore.readFrom(res)
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new GeminiError(
+      friendlyError(res.status, body, chosen),
+      res.status,
+      retryableStatus(res.status, body),
+    )
+  }
+
+  const json = await res.json()
+
+  // A safety block is a judgement about the sheet, not a fault in the model,
+  // so it stops the chain rather than sending the same image round again.
+  const blocked = json?.promptFeedback?.blockReason
+  if (blocked) throw new GeminiError(blockMessage(blocked))
+
+  const candidate = json?.candidates?.[0]
+  const text: string | undefined = candidate?.content?.parts?.[0]?.text
+  if (!text) {
+    const reason = candidate?.finishReason
+    if (reason === 'SAFETY' || reason === 'PROHIBITED_CONTENT')
+      throw new GeminiError(blockMessage(reason))
+    if (reason === 'MAX_TOKENS')
+      throw new GeminiError(
+        'The report was cut off before it finished. A dense sheet can outrun the response limit — crop to one section and run it again.',
+      )
+    // No text and no stated reason: the model misbehaved. Another one may not.
+    throw new GeminiError('The model returned an empty response.', undefined, true)
+  }
+
+  let parsed: Analysis
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    // Ignoring the response schema is a model failing at its job — worth
+    // handing to the next one down rather than showing the user a dead end.
+    throw new GeminiError('Could not parse the report the model returned.', undefined, true)
+  }
+
+  // Structured output guarantees the shape but not the optional arrays.
+  return normalizeAnalysis(parsed)
+}
+
+/**
+ * One chat attempt against one model on one credential.
+ *
+ * The streaming makes this different from analyze: once a fragment has been
+ * painted into the transcript, restarting on another model would splice two
+ * different answers together mid-sentence. So the moment anything is emitted
+ * the attempt stops being retryable, whatever went wrong afterwards.
+ */
+async function runChat(
+  input: ChatInput,
+  cred: Credential,
+  chosen: string,
+  signal: AbortSignal | undefined,
+  onDelta?: (text: string) => void,
+): Promise<string> {
+  // The sheet and the report ride along on the first turn, so every answer is
+  // grounded in what was actually drawn rather than in the transcript alone.
+  const opening = [
+    { inline_data: { mime_type: input.mimeType, data: input.imageBase64 } },
+    { text: buildUserPrompt(input.hint) },
+  ]
+  const report = {
+    role: 'model',
+    parts: [{ text: `My structured report on this schematic:\n${JSON.stringify(input.analysis)}` }],
+  }
+
+  const contents = [
+    { role: 'user', parts: opening },
+    report,
+    ...input.messages.map((m) => ({ role: m.role, parts: [{ text: m.text }] })),
+  ]
+
+  const { url, headers } = route(cred, `/models/${chosen}:streamGenerateContent`, { alt: 'sse' })
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    signal,
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: CHAT_SYSTEM_PROMPT }] },
+      contents,
+      safetySettings: SAFETY_SETTINGS,
+      generationConfig: { temperature: 0.2 },
+    }),
+  })
+
+  // Proxied responses carry the shared allowance; direct ones carry nothing
+  // and this is a no-op. Read before the status check so a 429 still updates
+  // the meter that explains it.
+  quotaStore.readFrom(res)
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new GeminiError(
+      friendlyError(res.status, body, chosen),
+      res.status,
+      retryableStatus(res.status, body),
+    )
+  }
+  if (!res.body) throw new GeminiError('The model returned an empty response.', undefined, true)
+
+  let emitted = false
+  try {
+    return await readSse(res.body, (text) => {
+      emitted = true
+      onDelta?.(text)
+    })
+  } catch (e) {
+    if (emitted && e instanceof GeminiError) throw new GeminiError(e.message, e.status, false)
+    throw e
+  }
 }
 
 export const geminiProvider: Provider = {
@@ -390,142 +568,37 @@ export const geminiProvider: Provider = {
 
   defaultModel: DEFAULT_MODEL,
 
-  async analyze(input: AnalyzeInput, { apiKey, model, signal }): Promise<Analysis> {
-    if (!apiKey && !usingProxy())
-      throw new GeminiError('No API key set. Add one in Settings.')
-    const chosen = model || DEFAULT_MODEL
-    const { url, headers } = route(`/models/${chosen}:generateContent`, {}, apiKey)
-
-    const res = await fetch(
-      url,
-      {
-        method: 'POST',
-        headers,
-        signal,
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                { text: buildUserPrompt(input.hint) },
-                { inline_data: { mime_type: input.mimeType, data: input.imageBase64 } },
-              ],
-            },
-          ],
-          safetySettings: SAFETY_SETTINGS,
-          generationConfig: {
-            // Near-deterministic. Reading designators off a sheet is a
-            // transcription task, and sampling breadth only invents values.
-            temperature: 0.1,
-            responseMimeType: 'application/json',
-            responseSchema: RESPONSE_SCHEMA,
-          },
-        }),
-      },
-    )
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => '')
-      throw new GeminiError(friendlyError(res.status, body, chosen), res.status)
-    }
-
-    const json = await res.json()
-
-    const blocked = json?.promptFeedback?.blockReason
-    if (blocked) throw new GeminiError(blockMessage(blocked))
-
-    const candidate = json?.candidates?.[0]
-    const text: string | undefined = candidate?.content?.parts?.[0]?.text
-    if (!text) {
-      const reason = candidate?.finishReason
-      if (reason === 'SAFETY' || reason === 'PROHIBITED_CONTENT')
-        throw new GeminiError(blockMessage(reason))
-      throw new GeminiError(
-        reason === 'MAX_TOKENS'
-          ? 'The report was cut off before it finished. A dense sheet can outrun the response limit — crop to one section and run it again.'
-          : 'The model returned an empty response.',
-      )
-    }
-
-    let parsed: Analysis
-    try {
-      parsed = JSON.parse(text)
-    } catch {
-      throw new GeminiError('Could not parse the report the model returned.')
-    }
-
-    // Structured output guarantees the shape but not the optional arrays.
-    return {
-      ...parsed,
-      isSchematic: parsed.isSchematic !== false,
-      sheet: parsed.sheet ?? { title: 'Untitled sheet', circuitType: 'Unknown' },
-      blocks: parsed.blocks ?? [],
-      connections: pruneConnections(parsed),
-      powerRails: parsed.powerRails ?? [],
-      grounds: parsed.grounds ?? [],
-      indicators: parsed.indicators ?? [],
-      testPoints: parsed.testPoints ?? [],
-      signals: parsed.signals ?? [],
-      connectors: parsed.connectors ?? [],
-      components: parsed.components ?? [],
-      theoryOfOperation: parsed.theoryOfOperation ?? [],
-      safetyNotes: parsed.safetyNotes ?? [],
-      unreadable: parsed.unreadable ?? [],
-      notes: parsed.notes ?? [],
-    }
+  async analyze(
+    input: AnalyzeInput,
+    { apiKey, model, signal, onModel, onCredential },
+  ): Promise<Analysis> {
+    return withFallbackChain({
+      credentials: requireCredentials(apiKey),
+      first: model || DEFAULT_MODEL,
+      listModels: listModelsOn,
+      onModel,
+      onCredential,
+      onFallback: ({ from, to, reason }) =>
+        console.info(`[gemini] ${from} refused this sheet, retrying on ${to}. ${reason}`),
+      attempt: (cred, chosen) => runAnalyze(input, cred, chosen, signal),
+    })
   },
 
-  async chat(input: ChatInput, { apiKey, model, signal }, onDelta): Promise<string> {
-    if (!apiKey && !usingProxy())
-      throw new GeminiError('No API key set. Add one in Settings.')
-    const chosen = model || DEFAULT_MODEL
-
-    // The sheet and the report ride along on the first turn, so every answer is
-    // grounded in what was actually drawn rather than in the transcript alone.
-    const opening = [
-      { inline_data: { mime_type: input.mimeType, data: input.imageBase64 } },
-      { text: buildUserPrompt(input.hint) },
-    ]
-    const report = {
-      role: 'model',
-      parts: [{ text: `My structured report on this schematic:\n${JSON.stringify(input.analysis)}` }],
-    }
-
-    const contents = [
-      { role: 'user', parts: opening },
-      report,
-      ...input.messages.map((m) => ({ role: m.role, parts: [{ text: m.text }] })),
-    ]
-
-    const { url, headers } = route(
-      `/models/${chosen}:streamGenerateContent`,
-      { alt: 'sse' },
-      apiKey,
-    )
-
-    const res = await fetch(
-      url,
-      {
-        method: 'POST',
-        headers,
-        signal,
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: CHAT_SYSTEM_PROMPT }] },
-          contents,
-          safetySettings: SAFETY_SETTINGS,
-          generationConfig: { temperature: 0.2 },
-        }),
-      },
-    )
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => '')
-      throw new GeminiError(friendlyError(res.status, body, chosen), res.status)
-    }
-    if (!res.body) throw new GeminiError('The model returned an empty response.')
-
-    return readSse(res.body, onDelta)
+  async chat(
+    input: ChatInput,
+    { apiKey, model, signal, onModel, onCredential },
+    onDelta,
+  ): Promise<string> {
+    return withFallbackChain({
+      credentials: requireCredentials(apiKey),
+      first: model || DEFAULT_MODEL,
+      listModels: listModelsOn,
+      onModel,
+      onCredential,
+      onFallback: ({ from, to, reason }) =>
+        console.info(`[gemini] ${from} could not answer, retrying on ${to}. ${reason}`),
+      attempt: (cred, chosen) => runChat(input, cred, chosen, signal, onDelta),
+    })
   },
 }
 
@@ -609,7 +682,10 @@ async function readSse(
   if (blockedBy) throw new GeminiError(blockMessage(blockedBy))
   if (lastReason === 'MAX_TOKENS')
     throw new GeminiError('The answer was cut off before any of it arrived. Try a shorter question.')
+  // Nothing was emitted, so the fallback chain is free to try another model.
   throw new GeminiError(
     `No answer came back${lastReason ? ` (${lastReason})` : ''}. Retry, or check the model in Settings still supports images.`,
+    undefined,
+    true,
   )
 }
