@@ -198,7 +198,7 @@ async function runAnalyze(
 
   let parsed: Analysis
   try {
-    parsed = JSON.parse(text)
+    parsed = JSON.parse(stripThinking(text))
   } catch {
     // JSON mode is a request, not a guarantee, the way Gemini's schema is.
     // A model that ignores it is worth handing to the next one down.
@@ -308,6 +308,9 @@ async function readSse(
   let buffer = ''
   let full = ''
   let finish = ''
+  // Reasoning models on Groq narrate inside <think> tags in `content` rather
+  // than in a field of their own. None of that belongs in the transcript.
+  const thinking = thinkStripper()
 
   function handle(event: string) {
     const payload = event
@@ -321,10 +324,13 @@ async function readSse(
       const json = JSON.parse(payload)
       const choice = json?.choices?.[0]
       if (choice?.finish_reason) finish = choice.finish_reason
-      const text = choice?.delta?.content
-      if (typeof text === 'string' && text) {
-        full += text
-        onDelta?.(text)
+      const raw = choice?.delta?.content
+      if (typeof raw === 'string' && raw) {
+        const text = thinking.push(raw)
+        if (text) {
+          full += text
+          onDelta?.(text)
+        }
       }
     } catch {
       // A malformed event is not worth losing the rest of the answer over.
@@ -358,6 +364,13 @@ async function readSse(
     reader.cancel().catch(() => {})
   }
 
+  // Anything the stripper was holding back pending a possible tag.
+  const tail = thinking.flush()
+  if (tail) {
+    full += tail
+    onDelta?.(tail)
+  }
+
   if (full) return full
   if (finish === 'length')
     throw new GroqError('The answer was cut off before any of it arrived. Try a shorter question.')
@@ -368,3 +381,100 @@ async function readSse(
     true,
   )
 }
+
+
+/** One-shot form of the stripper, for a response that arrives whole. */
+function stripThinking(text: string): string {
+  const f = thinkStripper()
+  return (f.push(text) + f.flush()).trim()
+}
+
+/**
+ * Strips <think>…</think> reasoning out of a stream of content fragments.
+ *
+ * Gemini flags reasoning with `thought` on the part, so it can be dropped by
+ * inspecting one field. Several Groq models — qwen3.6 among them — instead
+ * emit it inline in `content`, wrapped in a tag. Left alone, the transcript
+ * shows the model talking to itself for a paragraph before the answer starts.
+ *
+ * The awkward part is that a tag arrives split across deltas: "<thi" in one
+ * chunk and "nk>" in the next. So anything that could still turn out to be the
+ * start of a tag is held back rather than emitted and regretted. That costs a
+ * few characters of latency at a chunk boundary and nothing else.
+ */
+export function thinkStripper() {
+  const OPEN = '<think>'
+  const CLOSE = '</think>'
+
+  let buf = ''
+  let inside = false
+  // Starts true: an answer should never open with blank lines, and the streams
+  // that carry reasoning tend to lead with one before the opening tag. Set
+  // again on leaving a block, where the same padding follows.
+  let trimNext = true
+
+  /** Longest suffix of `s` that could be the beginning of `tag`. */
+  function partialTail(s: string, tag: string): number {
+    for (let n = Math.min(s.length, tag.length - 1); n > 0; n--) {
+      if (tag.startsWith(s.slice(s.length - n))) return n
+    }
+    return 0
+  }
+
+  function append(out: string[], text: string) {
+    if (!text) return
+    if (trimNext) {
+      const trimmed = text.replace(/^\s+/, '')
+      if (!trimmed) return
+      trimNext = false
+      out.push(trimmed)
+      return
+    }
+    out.push(text)
+  }
+
+  return {
+    push(chunk: string): string {
+      buf += chunk
+      const out: string[] = []
+
+      for (;;) {
+        if (!inside) {
+          const i = buf.indexOf(OPEN)
+          if (i !== -1) {
+            append(out, buf.slice(0, i))
+            buf = buf.slice(i + OPEN.length)
+            inside = true
+            continue
+          }
+          const keep = partialTail(buf, OPEN)
+          append(out, buf.slice(0, buf.length - keep))
+          buf = buf.slice(buf.length - keep)
+          break
+        }
+
+        const i = buf.indexOf(CLOSE)
+        if (i !== -1) {
+          buf = buf.slice(i + CLOSE.length)
+          inside = false
+          trimNext = true
+          continue
+        }
+        // Inside the block, so discard everything except a possible partial tag.
+        buf = buf.slice(buf.length - partialTail(buf, CLOSE))
+        break
+      }
+
+      return out.join('')
+    },
+
+    /** Whatever is left once the stream ends. An unterminated think block is
+     *  reasoning that never finished, so it stays dropped. */
+    flush(): string {
+      const rest = inside ? '' : buf
+      buf = ''
+      return trimNext ? rest.replace(/^\s+/, '') : rest
+    },
+  }
+}
+
